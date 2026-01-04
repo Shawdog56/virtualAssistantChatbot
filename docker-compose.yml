@@ -1,0 +1,16 @@
+services:
+  chatbot:
+    build: .
+    volumes:
+      - .:/app
+      # Map your Music folder so the chatbot can find files to play
+      - ~/Music:/root/Music 
+    environment:
+      - DISPLAY=host.docker.internal:0
+      - PYTHONUNBUFFERED=1
+    # Use host network so "127.0.0.1" in chatbot.py reaches your Django API
+    network_mode: "host" 
+    privileged: true
+    devices:
+      - "/dev/snd:/dev/snd"         # Audio support (Linux)
+      - "/dev/ttyUSB0:/dev/ttyUSB0"  # Microcontroller support
