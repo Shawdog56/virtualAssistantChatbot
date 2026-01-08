@@ -1,5 +1,6 @@
 import re
 import json
+import platform
 import requests
 import webbrowser
 import customtkinter as ctk
@@ -337,16 +338,19 @@ class MainApp(ctk.CTk):
             response = "Biblioteca actualizada."
 
         elif regex_commands["esp32_flash"].match(query_norm):
-            # Ya no preguntamos por el puerto, mpremote lo hace solo
-            self.add_message("📡 Preparando conexión. Por favor, selecciona los archivos.", is_user=False)
-            
-            file_paths = filedialog.askopenfilenames(title="Selecciona archivos para la ESP32")
-            
-            if file_paths:
-                # Lanzamos el proceso en un hilo para que la UI de CustomTkinter no se congele
-                threading.Thread(target=self.flash_process_mpremote, args=(file_paths,)).start()
+            if platform.system() == "Linux":
+                response = "Te encuentras en Linux, por favor, intenta desde la terminal con mpremote"
             else:
-                self.add_message("Operación cancelada.", is_user=False)
+                # Ya no preguntamos por el puerto, mpremote lo hace solo
+                self.add_message("📡 Preparando conexión. Por favor, selecciona los archivos.", is_user=False)
+                
+                file_paths = filedialog.askopenfilenames(title="Selecciona archivos para la ESP32")
+                
+                if file_paths:
+                    # Lanzamos el proceso en un hilo para que la UI de CustomTkinter no se congele
+                    threading.Thread(target=self.flash_process_mpremote, args=(file_paths,)).start()
+                else:
+                    self.add_message("Operación cancelada.", is_user=False)
 
         else:
             action_log = "ERROR"
