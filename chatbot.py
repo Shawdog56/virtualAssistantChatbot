@@ -6,10 +6,32 @@ import customtkinter as ctk
 import paho.mqtt.client as mqtt_paho
 
 from datetime import datetime
+from tkinter import filedialog
 from music_player.musicPlayer import Player
 from lister.listAudio import AudioFileLister
 
+import serial.tools.list_ports
+import threading
+import subprocess
+import threading
+
+def detect_esp32():
+    ports = serial.tools.list_ports.comports()
+    print(f"Se encontraron {len(ports)} puertos:")
+
+    for port in ports:
+        print(f"---")
+        print(f"Dispositivo: {port.device}")
+        print(f"Descripción: {port.description}")
+        print(f"Hardware ID: {port.hwid}")
+    for port in ports:
+        # Buscamos identificadores comunes de chips serial (CP210x o CH340)
+        if "CP210" in port.description or "CH340" in port.description or "USB Serial" in port.description:
+            return port.device
+    return None
+
 regex_commands = {
+    "esp32_flash": re.compile(r"(?i)^(?:graba(?: los archivos)?|flashea|sube archivos a) (?:la |mi )?esp32$"),
     "poner_musica": re.compile(r"(?i)^(?:reproduce(?: la cancion| en youtube)?|puedes poner(?: la cancion)?|pon(?: la cancion)?) (.+)$"),
     "busqueda": re.compile(r"(?i)^(?:busca(?: en internet| en google)?|investiga) (.+)$"),
     "dispositivo_accion": re.compile(r"(?i)^(enciende|apaga|consulta(?: estado de)?) (?:(?:mi )?dispositivo )?(.+)$"),
@@ -60,7 +82,7 @@ class LoginFrame(ctk.CTkFrame):
         super().__init__(master, **kwargs)
         self.login_callback = login_callback
 
-        self.label = ctk.CTkLabel(self, text="Soporte TI - LIXIL", font=("Roboto", 24, "bold"))
+        self.label = ctk.CTkLabel(self, text="Asistente Huesos", font=("Roboto", 24, "bold"))
         self.label.pack(pady=40)
 
         self.username = ctk.CTkEntry(self, placeholder_text="Usuario", width=250)
@@ -96,11 +118,11 @@ class LoginFrame(ctk.CTkFrame):
 class MainApp(ctk.CTk):
     def __init__(self):
         super().__init__()
-        self.title("LIXIL Assistant")
+        self.title("Chatbot Asistente Virtual Huesos")
         self.geometry("500x700")
 
         # 1. Configuración de MQTT para el Chatbot
-        self.mqtt_broker = "localhost"
+        self.mqtt_broker = "192.168.1.84"
         self.mqtt_port = 1883
         self.mqtt_client = mqtt_paho.Client()
         
@@ -314,6 +336,18 @@ class MainApp(ctk.CTk):
             self.lister.create_audio_file()
             response = "Biblioteca actualizada."
 
+        elif regex_commands["esp32_flash"].match(query_norm):
+            # Ya no preguntamos por el puerto, mpremote lo hace solo
+            self.add_message("📡 Preparando conexión. Por favor, selecciona los archivos.", is_user=False)
+            
+            file_paths = filedialog.askopenfilenames(title="Selecciona archivos para la ESP32")
+            
+            if file_paths:
+                # Lanzamos el proceso en un hilo para que la UI de CustomTkinter no se congele
+                threading.Thread(target=self.flash_process_mpremote, args=(file_paths,)).start()
+            else:
+                self.add_message("Operación cancelada.", is_user=False)
+
         else:
             action_log = "ERROR"
             response = "No entiendo ese comando."
@@ -321,6 +355,33 @@ class MainApp(ctk.CTk):
         # --- ENVÍO OBLIGATORIO A MQTT ---
         self.notify_worker(action_log, self.device)
         self.add_message(response, is_user=False)
+
+
+    def flash_process_mpremote(self, file_paths):
+        try:
+            self.add_message("🚀 Iniciando transferencia con mpremote...", is_user=False)
+            device = detect_esp32()
+            assert device is not None, "No se ha encontrado un dispositivo de ESP32"
+            for path in file_paths:
+                filename = path.split("/")[-1]
+                # Comando: mpremote cp [origen] :[destino]
+                # El ":" indica que es el sistema de archivos de la ESP32
+                command = ["python", "-m", "mpremote", "cp", path, f":{filename}"]
+                
+                # Ejecutamos el comando
+                result = subprocess.run(command, capture_output=True, text=True)
+                
+                if result.returncode == 0:
+                    self.add_message(f"✅ {filename} subido.", is_user=False)
+                else:
+                    self.add_message(f"❌ Error en {filename}: {result.stderr}", is_user=False)
+            
+            # Opcional: Reiniciar la placa después de subir todo
+            subprocess.run(["mpremote", "reset"])
+            self.add_message("✨ ¡Listo! La ESP32 se ha reiniciado.", is_user=False)
+            
+        except Exception as e:
+            self.add_message(f"⚠️ Error de sistema: {e}", is_user=False)
 
 if __name__ == "__main__":
     app = MainApp()
