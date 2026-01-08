@@ -3,6 +3,7 @@ import json
 import requests
 import webbrowser
 import customtkinter as ctk
+import paho.mqtt.client as mqtt_paho
 
 from datetime import datetime
 from music_player.musicPlayer import Player
@@ -21,7 +22,7 @@ regex_commands = {
 }
 
 # Configuración del servidor (Tu API de Django)
-API_URL = "http://127.0.0.1:8000/api/v1/"
+API_URL = "http://192.168.1.84:8000/api/v1/"
 
 ctk.set_appearance_mode("System")
 ctk.set_default_color_theme("blue")
@@ -84,8 +85,9 @@ class LoginFrame(ctk.CTkFrame):
             
             if response.status_code == 200:
                 token = response.json()["token"]
+                device = response.json()["device"]
                 print(token)
-                self.login_callback(token, user) 
+                self.login_callback(device, token, user) 
             else:
                 self.error_label.configure(text="Credenciales incorrectas")
         except requests.exceptions.ConnectionError:
@@ -97,48 +99,53 @@ class MainApp(ctk.CTk):
         self.title("LIXIL Assistant")
         self.geometry("500x700")
 
+        # 1. Configuración de MQTT para el Chatbot
+        self.mqtt_broker = "localhost"
+        self.mqtt_port = 1883
+        self.mqtt_client = mqtt_paho.Client()
+        
+        try:
+            self.mqtt_client.connect(self.mqtt_broker, self.mqtt_port, 60)
+            self.mqtt_client.loop_start() # Inicia el loop en un hilo secundario
+            print(f"[MQTT] Conectado al broker en {self.mqtt_broker}")
+        except Exception as e:
+            print(f"[MQTT ERROR] No se pudo conectar al broker: {e}")
+
         # Contenedor principal
         self.container = ctk.CTkFrame(self, fg_color="transparent")
         self.container.pack(fill="both", expand=True)
 
-        # Mostrar pantalla de login al inicio
         self.show_login()
 
     def show_login(self):
         for widget in self.container.winfo_children():
             widget.destroy()
-        
         self.login_view = LoginFrame(self.container, login_callback=self.show_chat)
         self.login_view.pack(fill="both", expand=True)
 
-    def show_chat(self, token, username):
+    def show_chat(self, device, token, username):
         assert token is not None, "Necesitas validar tu cuenta"
         self.lister = AudioFileLister()
         try:
             with open('./utils/audio_files.txt') as file:
                 songs = file.readlines()
         except Exception:
-            songs = None
+            songs = []
         
-        # Inicializamos el reproductor de música/audio que definimos antes
         self.player = Player([song.strip() for song in songs]) 
         self.username = username
-        # Limpiamos el contenedor (Login -> Chat)
+        self.token = token
+        self.device = device
+
         for widget in self.container.winfo_children():
             widget.destroy()
             
-        self.token = token
+        self.header = ctk.CTkLabel(self.container, text="🤖 Asistente Huesos", font=("Roboto", 20, "bold"))
+        self.header.pack(pady=(20, 10))
 
-        # 1. Título superior (Altura fija)
-        self.header = ctk.CTkLabel(self.container, text="🤖 Asistente personal", font=("Roboto", 20, "bold"))
-        self.header.pack(pady=(20, 10)) # Padding superior mayor que el inferior
-
-        # 2. Área de Chat (Prioridad de expansión)
-        # expand=True hace que este widget "empuje" a los demás y tome el espacio sobrante
         self.chat_frame = ctk.CTkScrollableFrame(self.container, fg_color="transparent")
         self.chat_frame.pack(fill="both", expand=True, padx=20, pady=0)
 
-        # 3. Contenedor inferior de entrada (Altura fija al fondo)
         self.input_frame = ctk.CTkFrame(self.container, fg_color="transparent")
         self.input_frame.pack(fill="x", padx=20, pady=20)
 
@@ -149,79 +156,170 @@ class MainApp(ctk.CTk):
         self.send_button = ctk.CTkButton(self.input_frame, text="Enviar", width=80, height=45, command=self.send_message)
         self.send_button.pack(side="right")
 
-        # Mensaje de bienvenida
-        self.add_message(f"¡Hola {self.username}! Soy tu asistente de TI. ¿En qué puedo ayudarte hoy?", is_user=False)
+        self.add_message(f"¡Hola {self.username}! Sistema listo. ¿Qué acción deseas ejecutar?", is_user=False)
 
     def add_message(self, message, is_user=True):
         new_message = ChatBubble(self.chat_frame, message=message, is_user=is_user)
         new_message.pack(fill="x")
-        # Lógica de Autoscroll:
-        # 1. Forzamos a la ventana a procesar los widgets recién creados (idletasks)
         self.update_idletasks()
-        
-        # 2. Movemos la vista al final (1.0 representa el 100% del scroll vertical)
         self.chat_frame._parent_canvas.yview_moveto(1.0)
 
     def send_message(self):
         user_text = self.entry.get()
         if not user_text: return
-        
-        # 1. Mostrar mensaje del usuario
         self.add_message(user_text, is_user=True)
         self.entry.delete(0, 'end')
-
-        # 2. Lógica de respuesta "IA"
         self.after(600, lambda: self.ai_reply(user_text))
+
+    # --- MÉTODO PARA NOTIFICAR AL TRABAJADOR MQTT ---
+    def notify_worker(self, action_code, device_id, topic="pusuas"):
+        """Envía el log de actividad al tópico pusuas."""
+        payload = {
+            "device_id": device_id,
+            "action": action_code.upper(),
+            "date": datetime.now().timestamp()
+        } if topic == "pusuas" else f"{action_code.lower()}"
+        print(action_code)
+        try:
+            self.mqtt_client.publish(topic, json.dumps(payload))
+            print(f"[LOG SENT] {action_code} for Device {device_id}")
+        except Exception as e:
+            print(f"[LOG ERROR] No se pudo publicar en MQTT: {e}")
 
     def ai_reply(self, query):
         query_norm = self.player.normalize(query).lower()
+        response = ""
+        topic_map = {}
+        action_log = "COMANDO NO PROCESADO, ERROR" # Acción por defecto si no hace match
+        target_device = 0          # ID por defecto si no es un dispositivo físico
+        try:
+            req = requests.get(f"{API_URL}user/{self.token}/device/all/")
+            if req.status_code == 200:
+                devs = [f"ID {d['id']}: {d['nombre']}" for d in req.json()["devices"]]
+                topic_map = {dev['is']:dev['topic'] for dev in req.json()["devices"]}
+                print(topic_map)
+            else: 
+                devs = None
+        except: 
+            devs = None
+            
+        # 1. Lógica de Música
+        if (regex_commands["musica_lista"].match(query_norm)):
+            action_log = "LISTAR MUSICA"
+            songs_list = [song.split("/")[-1].split(".")[0] for song in self.player.list_of_songs]
+            response = f"Tus canciones:\n" + "\n".join(songs_list)
 
-        if (lista_musica := regex_commands["musica_lista"].match(query_norm)):
-            response = f"Listando tus canciones\n{"\n".join([song.split("/")[-1].split(".")[0] for song in self.player.list_of_songs])}"
-        elif (poner_musica := regex_commands["poner_musica"].match(query_norm)):
+        elif (match := regex_commands["poner_musica"].match(query_norm)):
+            action_log = "REPRODUCIR MUSICA"
             try:
-                self.player.play(poner_musica.group(1))
-                response = f"Reproduciento {poner_musica.group(1)} en tu ordenador"
+                self.player.play(match.group(1))
+                response = f"Reproduciendo {match.group(1)}"
             except Exception:
-                self.add_message(f"No he podido reproducir {poner_musica.group(1)} en tu ordenador, buscando en youtube...", is_user=False)
-                URL = f"https://www.youtube.com/results?search_query={poner_musica.group(1)}"
-                webbrowser.open(URL)
-                response = f"Abriendo youtube con la búsqueda de {poner_musica.group(1)}"
-        elif (pausar_musica := regex_commands["musica_pausa"].match(query_norm)):
+                response = f"Buscando {match.group(1)} en YouTube..."
+                webbrowser.open(f"https://www.youtube.com/results?search_query={match.group(1)}")
+
+        elif (regex_commands["musica_pausa"].match(query_norm)):
+            action_log = "PAUSAR MUSICA"
             self.player.pause()
-            response = f"Pausando música..."
-        elif (detener_musica := regex_commands["musica_deten"].match(query_norm)):
-            self.player.stop()
-            response = f"Deteniendo música..."
-        elif (reanudar_musica := regex_commands["musica_reanuda"].match(query_norm)):
-            self.player.resume()
-            response = f"Reanudando música..."
-        elif (actualizar_musica := regex_commands["musica_update"].match(query_norm)):
-            self.lister.create_audio_file()
-            self.add_message("Actualizando biblioteca, esto puede tomar un momento...",is_user=False)
-            response = "Biblioteca de música actualizada"
-        elif (mostrar_dispositivos := regex_commands["dispositivo_lista"].match(query_norm)):
-            print(f"{API_URL}user/{self.token}/device/all/")
-            try:
-                request = requests.get(url=f"{API_URL}user/{self.token}/device/all/")
-                if request.status_code == 200:
-                    devices = [f"{device["id"]}: {device["nombre"]} :: {device["topic"]}" for device in request.json()["devices"]]
-                    string = "\n---\n".join(devices)
-                    response = f"Todos tus dispositivos:\n{string}"
-                else:
-                    raise Exception("No se recibieron los dispositivos correctamente")
-            except requests.exceptions.ConnectionError:
-                response = "No se pudo conectar con el servidor, intenta de nuevo"
-            except Exception:
-                response = "No se encontraron dispositivos vinculados a tu cuenta"
-        elif (accion_dispositivo := regex_commands["dispositivo_accion"].match(query_norm)):
-            response = f"Enviando acción a Dispositivo {accion_dispositivo.group(1)}"
-        elif (busqueda := regex_commands["busqueda"].match(query_norm)):
-            response = f"Abriendo el navegador para buscar {busqueda.group(1)}"
-            webbrowser.open(f"https://www.google.com/search?q={busqueda.group(1)}")
-        else:
-            response = f"Lo siento, no he podido procesar tu solicitud"
+            response = "Música pausada."
 
+        elif (regex_commands["musica_reanuda"].match(query_norm)):
+            action_log = "REANUDAR MUSICA"
+            self.player.resume()
+            response = "Se reanudó la reproducción."
+
+        elif (regex_commands["musica_deten"].match(query_norm)):
+            action_log = "DETENER MUSICA"
+            self.player.stop()
+            response = "Música detenida."
+
+        # 2. Lógica de Dispositivos (API + MQTT)
+        elif (regex_commands["dispositivo_lista"].match(query_norm)):
+            action_log = "LISTAR DISPOSITIVOS"
+            if devs == None:
+                try:
+                    req = requests.get(f"{API_URL}user/{self.token}/device/all/")
+                    if req.status_code == 200:
+                        devs = [f"ID {d['id']}: {d['nombre']}" for d in req.json()["devices"]]
+                        topic_map = {dev["id"]:dev["topic"] for dev in req.json()["devices"]}
+                        print(topic_map)
+                        response = "Dispositivos vinculados:\n" + "\n".join(devs)
+                    else: 
+                        devs = []
+                        response = "No pude obtener la lista de dispositivos."
+                except: 
+                    action_log += " ERROR"
+                    devs = None
+                    response = "Error de conexión con la API."
+            elif len(devs) > 0:
+                response = "Dispositivos vinculados:\n" + "\n".join(devs)
+            else:
+                response = "No tienes algún dispositivo vinculado a tu cuenta, accede al portal web para agregarlos y poder configurarlos"
+
+        elif (match := regex_commands["dispositivo_accion"].match(query_norm)):
+            verb = match.group(1).upper() # ENCIENDE / APAGA / CONSULTA
+            device_raw = match.group(2)
+            
+            action_log = f"{verb.upper}"
+
+            target_device = None
+
+            # Intentamos extraer el ID si el usuario lo dijo, si no usamos un ID de prueba (21)
+            if devs == None:
+                try:
+                    req = requests.get(f"{API_URL}user/{self.token}/device/all/")
+                    if req.status_code == 200:
+                        devs = [f"ID {d['id']}: {d['nombre']}" for d in req.json()["devices"]]
+                        topic_map = {dev["id"]:dev["topic"] for dev in req.json()["devices"]}
+                        print(topic_map)
+                        response = "Dispositivos vinculados:\n" + "\n".join(devs)
+                    else: 
+                        devs = []
+                except: 
+                    action_log += " ERROR"
+                    devs = None
+            
+            if devs == None:
+                response = "No se han detectado dispositivos"
+            else:
+                if len(devs) <= 0:
+                    response = "No tienes algún dispositivo vinculado a tu cuenta, accede al portal web para agregarlos y poder configurarlos"
+                    action_log += " ERROR"
+                else:
+                    if device_raw.replace(" ","").isdigit():
+                        target_device_temp = int(device_raw.replace(" ",""))
+                        for dev in devs:
+                            if f" {str(target_device_temp)}" in dev:
+                                target_device = target_device_temp
+                    else:
+                        for dev in devs:
+                            if device_raw.replace(" ","") == dev.split(":")[-1].replace(" ",""):
+                                target_device = int(dev.split(":")[0].split(" ")[-1])
+
+                    if target_device:
+                        self.notify_worker(verb,target_device,topic_map[target_device])
+                        response = f"Ejecutando: {verb} en dispositivo {target_device} en topic: {topic_map[target_device]}"
+
+                    else:
+                        response = "No cuentas con un dispositivo con ese nombre o ID"
+
+        # 3. Otros
+        elif (match := regex_commands["busqueda"].match(query_norm)):
+            action_log = "WEB SEARCH"
+            webbrowser.open(f"https://www.google.com/search?q={match.group(1)}")
+            response = f"Buscando {match.group(1)} en Google."
+
+        elif (regex_commands["musica_update"].match(query_norm)):
+            action_log = "ACTUALIZAR MUSICA"
+            self.lister.create_audio_file()
+            response = "Biblioteca actualizada."
+
+        else:
+            action_log = "ERROR"
+            response = "No entiendo ese comando."
+
+        # --- ENVÍO OBLIGATORIO A MQTT ---
+        self.notify_worker(action_log, self.device)
         self.add_message(response, is_user=False)
 
 if __name__ == "__main__":
