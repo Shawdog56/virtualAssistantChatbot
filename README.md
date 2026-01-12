@@ -38,3 +38,10 @@ virtualAssistantChatbot/
 ├── lister/          # Gestión de listas y visualización
 ├── chatbot.py       # Punto de entrada principal y lógica de la GUI
 └── flash_device.py  # Utilidad para configuración de hardware IoT
+```
+
+## Instalación y ejecución
+git clone [https://github.com/Shawdog56/virtualAssistantChatbot.git](https://github.com/Shawdog56/virtualAssistantChatbot.git)
+cd virtualAssistantChatbot
+pip install -r requirements.txt
+python chatbot.py
